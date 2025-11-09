@@ -368,19 +368,22 @@ def chat_completions(req: ChatCompletionRequest, account: Dict[str, Any] = Depen
 
         def event_gen() -> Generator[str, None, None]:
             tracker = None
+            first_chunk = True
             try:
-                yield _sse_format({
-                    "id": stream_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model_used,
-                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-                })
                 _, it, tracker = _send_upstream(stream=True)
                 assert it is not None
                 for piece in it:
                     if not piece:
                         continue
+                    if first_chunk:
+                        yield _sse_format({
+                            "id": stream_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_used,
+                            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                        })
+                        first_chunk = False
                     yield _sse_format({
                         "id": stream_id,
                         "object": "chat.completion.chunk",
