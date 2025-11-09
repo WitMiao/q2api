@@ -5,6 +5,7 @@ import time
 import sqlite3
 import importlib.util
 import random
+import threading
 from pathlib import Path
 from typing import Dict, Optional, List, Any, Generator, Tuple
 
@@ -107,6 +108,31 @@ def _row_to_dict(r: sqlite3.Row) -> Dict[str, Any]:
     return d
 
 _ensure_db()
+
+# ------------------------------------------------------------------------------
+# Background token refresh thread
+# ------------------------------------------------------------------------------
+
+def _refresh_stale_tokens():
+    while True:
+        try:
+            time.sleep(300)  # 5 minutes
+            now = time.time()
+            with _conn() as conn:
+                rows = conn.execute("SELECT id, last_refresh_time FROM accounts WHERE enabled=1").fetchall()
+                for row in rows:
+                    acc_id, last_refresh = row[0], row[1]
+                    if last_refresh:
+                        try:
+                            last_time = time.mktime(time.strptime(last_refresh, "%Y-%m-%dT%H:%M:%S"))
+                            if now - last_time > 1500:  # 25 minutes
+                                refresh_access_token_in_db(acc_id)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+threading.Thread(target=_refresh_stale_tokens, daemon=True).start()
 
 # ------------------------------------------------------------------------------
 # Env and API Key authorization (keys are independent of AWS accounts)
@@ -341,17 +367,7 @@ def chat_completions(req: ChatCompletionRequest, account: Dict[str, Any] = Depen
             access = refreshed.get("accessToken")
             if not access:
                 raise HTTPException(status_code=502, detail="Access token unavailable after refresh")
-        try:
-            return send_chat_request(access, [m.model_dump() for m in req.messages], model=model, stream=stream)
-        except requests.HTTPError as e:
-            status = getattr(e.response, "status_code", None)
-            if status in (401, 403):
-                refreshed = refresh_access_token_in_db(account["id"])
-                access2 = refreshed.get("accessToken")
-                if not access2:
-                    raise HTTPException(status_code=502, detail="Token refresh failed")
-                return send_chat_request(access2, [m.model_dump() for m in req.messages], model=model, stream=stream)
-            raise
+        return send_chat_request(access, [m.model_dump() for m in req.messages], model=model, stream=stream)
 
     if not do_stream:
         try:
