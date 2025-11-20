@@ -1,6 +1,7 @@
 import json
 import uuid
 import os
+import asyncio
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Iterator, List, AsyncGenerator, Any
 import struct
@@ -330,22 +331,62 @@ async def send_chat_request(
                 # Wrap generator to ensure cleanup on early termination
                 async def _safe_iter_events():
                     try:
-                        async for item in _iter_events():
-                            yield item
+                        # 托底方案: 300秒强制超时
+                        async with asyncio.timeout(300):
+                            async for item in _iter_events():
+                                yield item
+                    except asyncio.TimeoutError:
+                        # 超时强制关闭
+                        if resp and not resp.is_closed:
+                            await resp.aclose()
+                        if local_client and client:
+                            await client.aclose()
+                        raise
                     except GeneratorExit:
                         # Generator was closed without being fully consumed
-                        # The finally block in _iter_events will handle cleanup
+                        # Ensure cleanup happens even if finally block wasn't reached
+                        if resp and not resp.is_closed:
+                            await resp.aclose()
+                        if local_client and client:
+                            await client.aclose()
+                        raise
+                    except Exception:
+                        # Any exception should also trigger cleanup
+                        if resp and not resp.is_closed:
+                            await resp.aclose()
+                        if local_client and client:
+                            await client.aclose()
                         raise
                 return None, None, tracker, _safe_iter_events()
             
             # Wrap text generator to ensure cleanup on early termination
             async def _safe_iter_text():
                 try:
-                    async for item in tracker.track(_iter_text()):
-                        yield item
+                    # 托底方案: 300秒强制超时
+                    async with asyncio.timeout(300):
+                        async for item in tracker.track(_iter_text()):
+                            yield item
+                except asyncio.TimeoutError:
+                    # 超时强制关闭
+                    if resp and not resp.is_closed:
+                        await resp.aclose()
+                    if local_client and client:
+                        await client.aclose()
+                    raise
                 except GeneratorExit:
                     # Generator was closed without being fully consumed
-                    # The finally block in _iter_events will handle cleanup
+                    # Ensure cleanup happens even if finally block wasn't reached
+                    if resp and not resp.is_closed:
+                        await resp.aclose()
+                    if local_client and client:
+                        await client.aclose()
+                    raise
+                except Exception:
+                    # Any exception should also trigger cleanup
+                    if resp and not resp.is_closed:
+                        await resp.aclose()
+                    if local_client and client:
+                        await client.aclose()
                     raise
             return None, _safe_iter_text(), tracker, None
         else:
