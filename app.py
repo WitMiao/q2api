@@ -20,6 +20,7 @@ import httpx
 import tiktoken
 
 from db import init_db, close_db, row_to_dict
+from message_processor import process_history_for_amazonq, merge_duplicate_tool_results
 
 # ------------------------------------------------------------------------------
 # Tokenizer
@@ -573,7 +574,36 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
         traceback.print_exc()
         raise HTTPException(status_code=400, detail=f"Request conversion failed: {str(e)}")
 
-    # 2. Send upstream
+    # 2. Post-process: merge consecutive user messages and duplicate toolResults
+    try:
+        conversation_state = aq_request.get("conversationState", {})
+        history = conversation_state.get("history", [])
+
+        if history:
+            # Merge consecutive user messages
+            processed_history = process_history_for_amazonq(history)
+            conversation_state["history"] = processed_history
+            aq_request["conversationState"] = conversation_state
+
+        # Merge duplicate toolResults in currentMessage
+        current_message = conversation_state.get("currentMessage", {})
+        user_input_message = current_message.get("userInputMessage", {})
+        user_input_message_context = user_input_message.get("userInputMessageContext", {})
+
+        tool_results = user_input_message_context.get("toolResults", [])
+        if tool_results:
+            merged_tool_results = merge_duplicate_tool_results(tool_results)
+            user_input_message_context["toolResults"] = merged_tool_results
+            user_input_message["userInputMessageContext"] = user_input_message_context
+            current_message["userInputMessage"] = user_input_message
+            conversation_state["currentMessage"] = current_message
+            aq_request["conversationState"] = conversation_state
+    except Exception as e:
+        # Log but don't fail - the original request might still work
+        traceback.print_exc()
+        print(f"Warning: Post-processing failed: {e}")
+
+    # 3. Send upstream
     async def _send_upstream_raw() -> Tuple[Optional[str], Optional[AsyncGenerator[str, None]], Any, Optional[AsyncGenerator[Any, None]]]:
         access = account.get("accessToken")
         if not access:
