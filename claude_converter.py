@@ -196,7 +196,7 @@ def merge_user_messages(messages: List[Dict[str, Any]], hint: str = THINKING_HIN
                 all_tool_results.extend(msg_ctx["toolResults"])
         
         if base_origin is None:
-            base_origin = msg.get("origin", "CLI")
+            base_origin = msg.get("origin", "KIRO_CLI")
         if base_model is None:
             base_model = msg.get("modelId")
         
@@ -222,7 +222,7 @@ def merge_user_messages(messages: List[Dict[str, Any]], hint: str = THINKING_HIN
     result = {
         "content": merged_content,
         "userInputMessageContext": base_context or {},
-        "origin": base_origin or "CLI",
+        "origin": base_origin or "KIRO_CLI",
         "modelId": base_model
     }
     
@@ -336,7 +336,7 @@ def process_history(messages: List[ClaudeMessage], thinking_enabled: bool = Fals
             u_msg = {
                 "content": text_content,
                 "userInputMessageContext": user_ctx,
-                "origin": "CLI"
+                "origin": "KIRO_CLI"
             }
             if images:
                 u_msg["images"] = images
@@ -601,7 +601,7 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
     user_input_msg = {
         "content": formatted_content,
         "userInputMessageContext": user_ctx,
-        "origin": "CLI",
+        "origin": "KIRO_CLI",
         "modelId": model_id
     }
     if images:
