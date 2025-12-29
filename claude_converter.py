@@ -193,79 +193,125 @@ def convert_tool(tool: ClaudeTool) -> Dict[str, Any]:
         }
     }
 
+def _merge_tool_result_into_dict(tool_results_by_id: Dict[str, Dict[str, Any]], tool_result: Dict[str, Any]) -> None:
+    """
+    Merge a tool_result into the deduplicated dict.
+    If toolUseId already exists, merge the content arrays.
+
+    Args:
+        tool_results_by_id: Dict mapping toolUseId to tool_result
+        tool_result: The tool_result to merge
+    """
+    tool_use_id = tool_result.get("toolUseId")
+    if not tool_use_id:
+        return
+
+    if tool_use_id in tool_results_by_id:
+        # Merge content arrays
+        existing = tool_results_by_id[tool_use_id]
+        existing_content = existing.get("content", [])
+        new_content = tool_result.get("content", [])
+
+        # Deduplicate content by text value
+        existing_texts = {item.get("text", "") for item in existing_content if isinstance(item, dict)}
+        for item in new_content:
+            if isinstance(item, dict):
+                text = item.get("text", "")
+                if text and text not in existing_texts:
+                    existing_content.append(item)
+                    existing_texts.add(text)
+
+        existing["content"] = existing_content
+
+        # If any result has error status, keep error
+        if tool_result.get("status") == "error":
+            existing["status"] = "error"
+
+        logger.debug(f"Merged duplicate toolUseId {tool_use_id}")
+    else:
+        # New toolUseId, add to dict
+        tool_results_by_id[tool_use_id] = tool_result.copy()
+
+
 def merge_user_messages(messages: List[Dict[str, Any]], hint: str = THINKING_HINT) -> Dict[str, Any]:
     """Merge consecutive user messages, keeping only the last 2 messages' images.
-    
+
     IMPORTANT: This function properly merges toolResults from all messages to prevent
     losing tool execution history, which would cause infinite loops.
-    
-    When merging messages that contain thinking hints, removes duplicate hints and 
+
+    Key fix: Deduplicate toolResults by toolUseId to prevent duplicate tool_result
+    entries that cause the model to repeatedly respond to the same user message.
+
+    When merging messages that contain thinking hints, removes duplicate hints and
     ensures only one hint appears at the end of the merged content.
-    
+
     Args:
         messages: List of user messages to merge
         hint: The thinking hint string to deduplicate
     """
     if not messages:
         return {}
-    
+
     all_contents = []
     base_context = None
     base_origin = None
     base_model = None
     all_images = []
-    all_tool_results = []  # Collect toolResults from all messages
-    
+    # Use dict to deduplicate toolResults by toolUseId
+    tool_results_by_id: Dict[str, Dict[str, Any]] = {}
+
     for msg in messages:
         content = msg.get("content", "")
         msg_ctx = msg.get("userInputMessageContext", {})
-        
+
         # Initialize base context from first message
         if base_context is None:
             base_context = msg_ctx.copy() if msg_ctx else {}
             # Remove toolResults from base to merge them separately
             if "toolResults" in base_context:
-                all_tool_results.extend(base_context.pop("toolResults"))
+                for tr in base_context.pop("toolResults"):
+                    _merge_tool_result_into_dict(tool_results_by_id, tr)
         else:
             # Collect toolResults from subsequent messages
             if "toolResults" in msg_ctx:
-                all_tool_results.extend(msg_ctx["toolResults"])
-        
+                for tr in msg_ctx["toolResults"]:
+                    _merge_tool_result_into_dict(tool_results_by_id, tr)
+
         if base_origin is None:
             base_origin = msg.get("origin", "KIRO_CLI")
         if base_model is None:
             base_model = msg.get("modelId")
-        
+
         # Remove thinking hint from individual message content to avoid duplication
         # The hint will be added once at the end of the merged content
         if content:
             content_cleaned = content.replace(hint, "").strip()
             if content_cleaned:
                 all_contents.append(content_cleaned)
-        
+
         # Collect images from each message
         msg_images = msg.get("images")
         if msg_images:
             all_images.append(msg_images)
-    
+
     # Merge content and ensure thinking hint appears only once at the end
     merged_content = "\n\n".join(all_contents)
     # Check if any of the original messages had the hint (indicating thinking was enabled)
     had_thinking_hint = any(hint in msg.get("content", "") for msg in messages)
     if had_thinking_hint:
         merged_content = _append_thinking_hint(merged_content, hint)
-    
+
     result = {
         "content": merged_content,
         "userInputMessageContext": base_context or {},
         "origin": base_origin or "KIRO_CLI",
         "modelId": base_model
     }
-    
-    # Add merged toolResults if any
-    if all_tool_results:
-        result["userInputMessageContext"]["toolResults"] = all_tool_results
-    
+
+    # Add deduplicated toolResults if any
+    if tool_results_by_id:
+        result["userInputMessageContext"]["toolResults"] = list(tool_results_by_id.values())
+
     # Only keep images from the last 2 messages that have images
     if all_images:
         kept_images = []
@@ -273,21 +319,56 @@ def merge_user_messages(messages: List[Dict[str, Any]], hint: str = THINKING_HIN
             kept_images.extend(img_list)
         if kept_images:
             result["images"] = kept_images
-    
+
     return result
+
+def _reorder_tool_results_by_tool_uses(tool_results: List[Dict[str, Any]], tool_use_order: List[str]) -> List[Dict[str, Any]]:
+    """Reorder tool_results to match the order of tool_uses from the preceding assistant message.
+
+    This is critical for preventing model confusion when parallel tool calls return results
+    in a different order than they were called.
+
+    Args:
+        tool_results: List of tool_result dicts with toolUseId
+        tool_use_order: List of toolUseIds in the order they appeared in the assistant message
+
+    Returns:
+        Reordered list of tool_results
+    """
+    if not tool_use_order or not tool_results:
+        return tool_results
+
+    result_by_id = {r["toolUseId"]: r for r in tool_results}
+    ordered_results = []
+
+    # Add results in the order of tool_uses
+    for tool_use_id in tool_use_order:
+        if tool_use_id in result_by_id:
+            ordered_results.append(result_by_id.pop(tool_use_id))
+
+    # Add any remaining results not in the original order (shouldn't happen normally)
+    ordered_results.extend(result_by_id.values())
+
+    return ordered_results
+
 
 def process_history(messages: List[ClaudeMessage], thinking_enabled: bool = False, hint: str = THINKING_HINT) -> List[Dict[str, Any]]:
     """Process history messages to match Amazon Q format (alternating user/assistant).
-    
+
     Dual-mode detection:
     - If messages already alternate correctly (no consecutive user/assistant), skip merging
     - If messages have consecutive same-role messages, apply merge logic
+
+    Key fix: Track tool_use order from assistant messages and reorder tool_results in user
+    messages to match. This prevents model confusion when parallel tool calls return results
+    in a different order than they were called.
     """
     history = []
-    seen_tool_use_ids = set()
-    
+    seen_tool_use_ids = set()  # Track tool_use IDs in assistant messages
+    last_tool_use_order = []  # Track order of tool_uses from the last assistant message
+
     raw_history = []
-    
+
     # First pass: convert individual messages
     for msg in messages:
         if msg.role == "user":
@@ -296,7 +377,7 @@ def process_history(messages: List[ClaudeMessage], thinking_enabled: bool = Fals
             tool_results = None
             images = extract_images_from_content(content)
             should_append_hint = thinking_enabled
-            
+
             if isinstance(content, list):
                 text_parts = []
                 for block in content:
@@ -307,10 +388,12 @@ def process_history(messages: List[ClaudeMessage], thinking_enabled: bool = Fals
                         elif btype == "thinking":
                             text_parts.append(_wrap_thinking_content(block.get("thinking", "")))
                         elif btype == "tool_result":
+                            tool_use_id = block.get("tool_use_id")
+
                             if tool_results is None:
                                 tool_results = []
                             result = _process_tool_result_block(block)
-                            # Merge if exists
+                            # Merge if exists within this message
                             existing = next((r for r in tool_results if r["toolUseId"] == result["toolUseId"]), None)
                             if existing:
                                 existing["content"].extend(result["content"])
@@ -321,10 +404,15 @@ def process_history(messages: List[ClaudeMessage], thinking_enabled: bool = Fals
                 text_content = "\n".join(text_parts)
             else:
                 text_content = extract_text_from_content(content)
-            
+
             if should_append_hint:
                 text_content = _append_thinking_hint(text_content, hint)
-            
+
+            # Reorder tool_results to match the order of tool_uses from the preceding assistant message
+            if tool_results and last_tool_use_order:
+                tool_results = _reorder_tool_results_by_tool_uses(tool_results, last_tool_use_order)
+                logger.info(f"Reordered {len(tool_results)} tool_results to match tool_uses order")
+
             user_ctx = {
                 "envState": {
                     "operatingSystem": "macos",
@@ -341,20 +429,22 @@ def process_history(messages: List[ClaudeMessage], thinking_enabled: bool = Fals
             }
             if images:
                 u_msg["images"] = images
-                
+
             raw_history.append({"userInputMessage": u_msg})
-            
+
         elif msg.role == "assistant":
             content = msg.content
             text_content = extract_text_from_content(content)
-            
+
             entry = {
                 "assistantResponseMessage": {
                     "messageId": str(uuid.uuid4()),
                     "content": text_content
                 }
             }
-            
+
+            # Track tool_use order for reordering tool_results in the next user message
+            last_tool_use_order = []
             if isinstance(content, list):
                 tool_uses = []
                 for block in content:
@@ -362,6 +452,7 @@ def process_history(messages: List[ClaudeMessage], thinking_enabled: bool = Fals
                         tid = block.get("id")
                         if tid and tid not in seen_tool_use_ids:
                             seen_tool_use_ids.add(tid)
+                            last_tool_use_order.append(tid)  # Track order
                             tool_uses.append({
                                 "toolUseId": tid,
                                 "name": block.get("name"),
@@ -369,7 +460,7 @@ def process_history(messages: List[ClaudeMessage], thinking_enabled: bool = Fals
                             })
                 if tool_uses:
                     entry["assistantResponseMessage"]["toolUses"] = tool_uses
-            
+
             raw_history.append(entry)
 
     # Dual-mode detection: check if messages already alternate correctly
@@ -540,6 +631,26 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
             prompt_content = "\n".join(text_parts)
         else:
             prompt_content = extract_text_from_content(content)
+
+    # Get tool_use order from the last assistant message for reordering current message's tool_results
+    last_tool_use_order = []
+    if len(req.messages) >= 2:
+        # Find the last assistant message before the current user message
+        for i in range(len(req.messages) - 2, -1, -1):
+            if req.messages[i].role == "assistant":
+                assistant_content = req.messages[i].content
+                if isinstance(assistant_content, list):
+                    for block in assistant_content:
+                        if isinstance(block, dict) and block.get("type") == "tool_use":
+                            tid = block.get("id")
+                            if tid:
+                                last_tool_use_order.append(tid)
+                break
+
+    # Reorder tool_results to match the order of tool_uses from the preceding assistant message
+    if tool_results and last_tool_use_order:
+        tool_results = _reorder_tool_results_by_tool_uses(tool_results, last_tool_use_order)
+        logger.info(f"Reordered {len(tool_results)} current message tool_results to match tool_uses order")
 
     # 3. Context
     user_ctx = {
