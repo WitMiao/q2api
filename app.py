@@ -812,6 +812,13 @@ async def claude_messages(
         except Exception:
             pass
         await _update_stats(account["id"], False)
+
+        # Extract upstream status code from "Upstream error {code}: {message}"
+        err_msg = str(e)
+        if err_msg.startswith("Upstream error "):
+            match = re.match(r"Upstream error (\d+):", err_msg)
+            if match:
+                raise HTTPException(status_code=int(match.group(1)), detail=err_msg)
         raise
 
 @app.post("/v1/messages/count_tokens")
